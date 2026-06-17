@@ -2433,8 +2433,11 @@ function TallyTab({job,setJob,role,viewDate,setViewDate}){
     const val=parseInt(v)||0;
     setRuns(r=>r.map(run=>run.id===rid?{...run,mobs:mobsOf(run).map(m=>m.id===mid?{...m,counts:{...m.counts,[cid]:val}}:m)}:run));
     /* v4.6.4 — pass the mob's current type/desc so the cell write carries the
-       metadata to tally_entries (source of truth). Read from live runs state. */
-    const _run=(runs||[]).find(r=>r.id===rid);
+       metadata to tally_entries (source of truth). dayRuns is the in-scope
+       per-day array in TallyTab (NOT 'runs' — that var doesn't exist here;
+       referencing it threw a ReferenceError that silently killed the cell
+       write — Kimba first-deploy, 17 Jun). */
+    const _run=(dayRuns||[]).find(r=>r.id===rid);
     const _mob=_run?mobsOf(_run).find(m=>m.id===mid):null;
     writeTallyCell({jobId:job.id,kind:'count',runId:rid,mobId:mid,crewId:cid,date:viewDate,value:val,mobType:_mob?_mob.type:null,mobDesc:_mob?(_mob.desc||''):null});
   };
