@@ -548,13 +548,14 @@ const LS_WB_SEEN='mg_wb_seen_'+CONTRACTOR_SLUG; /* v4.6.10 - per-device whiteboa
 const LS_FARMER_ID='mg_farmer_id_'+CONTRACTOR_SLUG; /* v4.6.11 - farmer device farm binding (PIN-gated visibility, not auth) */
 const LS_DEFAULT_RATES='mg_default_rates_'+CONTRACTOR_SLUG; /* v4.6.11 - contractor-level default rates cache (server-authoritative seed; durable home for the old LS_LAST_RATES per-device caveat) */
 const LS_APP_SETTINGS='mg_app_settings_'+CONTRACTOR_SLUG; /* v4.6.11b - contractor-level app settings cache (contractor_settings.app_settings). crewView:'all' disables the read_only Who-are-you picker (pre-4.6.10 behaviour); unset/'mine' keeps crew view. */
+const LS_LEAD_ID='mg_lead_id_'+CONTRACTOR_SLUG; /* v4.6.13 - designated-lead device binding (which crew member unlocked Lead on this device) */
 const LS_ROLE_TS='mg_role_ts_'+CONTRACTOR_SLUG;
 const LS_DATA_VERSION='mg_data_version_'+CONTRACTOR_SLUG; /* tracks DATA_VERSION for one-time cache wipe */
 const LS_TALLY_QUEUE='mg_tally_queue_'+CONTRACTOR_SLUG; /* per-cell offline queue, separate from whole-job queue */
 const LS_TALLY_DEAD='mg_tally_dead_'+CONTRACTOR_SLUG; /* v4.6.3g — quarantined cells (permanent rejection). Replayed once on boot in case the server-side blocker (e.g. missing kind constraint) was since fixed. */
 const LS_TALLY_META_QUEUE='mg_tally_meta_queue_'+CONTRACTOR_SLUG; /* v4.6.4 — offline/failed mob metadata (type/desc) updates to existing count cells; flushed alongside the tally queue. */
 const ROLE_TIMEOUT_HOURS=12; /* auto-reset after 12h inactivity */
-const APP_VERSION='v4.6.12a';
+const APP_VERSION='v4.6.13';
 const SUPER_RATE=0.12; /* SG rate, 12% from 1 Jul 2025. One-line change if legislated rate moves. */
 /* v4.6.12a (26 Jul 2026): fleet-alignment rebuild - feature content identical to v4.6.12; new version string per one-build-one-version discipline. */
 /* v4.6.12 (20 Jul 2026): PER-CREW PIN, contractor-controlled (design settled with the founder before any deploy; an earlier worker-self-set draft was discarded - self-set has a bootstrap race where an imposter claims a name first and sets its PIN). MODEL: every worker is AUTO-ASSIGNED a random 4-digit PIN (genCrewPin at creation; existing crew backfilled via SQL per contractor at rollout). The PIN is stored READABLE at crew_members.data.pin and shown on the worker's card in My Database (admin-only surface) with a regenerate button and a 'Text PIN' button (plain GSM-7 SMS via /api/send-sms so the worker has it on file). DELIBERATE ENGINEERING CALL, not an oversight: with the shared anon key and a 4-digit space, a hash is brute-forced in under a second by anyone determined, so hashing here is theatre; readable storage buys contractor look-up-ability at no real security cost. This is a visibility gate against casual wrong-name claims - real authentication is v5 (Supabase Auth + RLS). CLAIM FLOW: picking a name with a PIN demands it (CrewPinVerifyModal, direct compare, works offline once the record is synced; names with PINs show a lock in the picker); 'Not you?' re-challenges; app_settings.requireCrewPin=true blocks claiming names with NO pin ('ask your contractor') for hard-lockdown contractors, off = pinless names bind as before. Workers never set or change their own PIN; contractor regenerates on request (specific chosen PINs = SRD via SQL). Lead/Admin PINs and the per-job PIN untouched. */
@@ -1510,6 +1511,29 @@ async function dbSaveCrew(member){
 let FARMS=[];
 let CREW=[];
 function syncLookups(farms,crew){FARMS.length=0;FARMS.push(...(farms||[]));CREW.length=0;CREW.push(...(crew||[]));}
+/* v4.6.13 — DESIGNATED LEAD.
+   Same shape as FARMS/CREW: a module-level mirror of the jobs array so TopBar can
+   answer "is this person a lead anywhere?" without prop-drilling jobs through three
+   screens. Kept in sync by an effect in App. */
+let JOBS_LU=[];
+function syncJobsLookup(jobs){JOBS_LU.length=0;JOBS_LU.push(...(jobs||[]));}
+/* Contractor toggle, deliberately SEPARATE from requireCrewPin: Cutting Edge already
+   runs requireCrewPin=true, and turning designated leads on must never be a side
+   effect of a switch that is already flipped. Off (unset) = v4.6.12 behaviour exactly. */
+function designatedLeadsOn(){return (lsGet(LS_APP_SETTINGS)||{}).designatedLeads===true;}
+/* Crew ids designated lead on at least one job that is not archived. Drives the Lead
+   name picker, so nobody who has not been given the role can even see a name to try. */
+function leadCrewIds(){
+  const out=new Set();
+  (JOBS_LU||[]).forEach(j=>{if(j&&j.leadId&&j.status!=='Charged Out')out.add(j.leadId);});
+  return out;
+}
+/* Is this device's Lead unlock scoped to one person? Only when the toggle is on AND
+   a lead identity is bound. Anything else falls back to the shared Lead PIN, which is
+   what every contractor still runs today. */
+function boundLeadId(){return designatedLeadsOn()?(lsGet(LS_LEAD_ID)||null):null;}
+/* The visibility rule. Admin is never scoped. A scoped lead sees only their own sheds. */
+function leadCanSeeJob(job,leadId){return !leadId||job.leadId===leadId;}
 const mkRun=(id,type,desc,counts,ro)=>({id,mobs:[{id:id+'_m1',type,desc,counts,...(ro!=null?{rateOverride:ro}:{})}]});
 const mkRates=(ov={})=>{
   const last=lsGet(LS_LAST_RATES)||{};
@@ -1623,7 +1647,14 @@ function jobDates(j){
      regardless of the weekend toggle. */
   const present=new Set(ds);
   const ensure=d=>{if(d&&!present.has(d)){present.add(d);ds.push(d);}};
-  if((j.status||'Active')==='Active')ensure(localToday());
+  /* v4.6.13: ...but only once the job has actually started. Unguarded, this injected
+     today into every future-dated Active job; ds.sort() then put today FIRST, so the
+     Schedule flagged it isStart and drew the job as starting today with its real start
+     date rendered as a faded continuation. Proven live 5 Aug (two jobs starting the 7th
+     both sitting on the 5th). The overrun extension above is untouched — a job running
+     past its allocated days still reaches today, because that loop walks forward from
+     the last planned day. */
+  if((j.status||'Active')==='Active'&&localToday()>=j.startDate)ensure(localToday());
   Object.keys(j.runs||{}).forEach(ensure);
   ['shedTallies','baleTallies','baleWeights','travelTallies','messTallies'].forEach(k=>{
     const t=j[k];if(!t)return;
@@ -2825,11 +2856,23 @@ function AdminPinModal({onSuccess,onClose}){
 }
 
 function TopBar({role,setRole,onBack,backLabel,onSchedule}){
-  const [showPin,setShowPin]=useState(null); /* 'lead' | 'admin' | 'farmer' */
+  const [showPin,setShowPin]=useState(null); /* 'lead' | 'leadPerson' | 'admin' | 'farmer' */
   const [farmerPick,setFarmerPick]=useState(null); /* v4.6.11 - farm chosen in the farmer gate */
+  const [leadPick,setLeadPick]=useState(null); /* v4.6.13 - crew member chosen in the lead gate */
   const farmerFarms=(FARMS||[]).filter(f=>f.farmerPinHash); /* farms with farmer access enabled */
+  /* v4.6.13 - only people actually designated lead on a live job can be picked. Someone
+     who has not been given the role never sees a name to guess a PIN against. */
+  const leadIds=leadCrewIds();
+  const leadCandidates=(CREW||[]).filter(c=>leadIds.has(c.id)&&c.pin);
+  const perPersonLead=designatedLeadsOn()&&leadCandidates.length>0;
   const requestRole=rv=>{
-    if(rv==='shed_lead'&&role!=='shed_lead'&&role!=='admin')setShowPin('lead');
+    if(rv==='shed_lead'&&role!=='shed_lead'&&role!=='admin'&&perPersonLead){
+      /* If this device is already bound to someone who is a designated lead, skip the
+         picker and go straight to their PIN — one tap, one number, same as the shed. */
+      const bound=(CREW||[]).find(c=>c.id===(lsGet(LS_MY_ID)||null)&&leadIds.has(c.id)&&c.pin);
+      setLeadPick(bound||null);setShowPin('leadPerson');
+    }
+    else if(rv==='shed_lead'&&role!=='shed_lead'&&role!=='admin')setShowPin('lead');
     else if(rv==='admin'&&role!=='admin')setShowPin('admin');
     else if(rv==='farmer'&&role!=='farmer'){setFarmerPick(null);setShowPin('farmer');} /* v4.6.11 */
     else setRole(rv);
@@ -2859,6 +2902,27 @@ function TopBar({role,setRole,onBack,backLabel,onSchedule}){
           onCancel:()=>setFarmerPick(null),
           allowChange:false,
         })
+      )
+    ),
+    /* v4.6.13 - DESIGNATED LEAD GATE. Tara unlocks with her own 4-digit crew PIN, the
+       same number she already uses to claim her name. No second credential, nothing new
+       to distribute, and the scope lands in LS_LEAD_ID so she sees only her own sheds. */
+    showPin==='leadPerson'&&e('div',{className:'pin-modal'},
+      e('div',{className:'pin-modal-box'},
+        !leadPick?e('div',null,
+          e('div',{style:{fontFamily:'var(--h)',fontSize:18,fontWeight:800,marginBottom:4}},'Shed lead'),
+          e('div',{style:{color:'var(--muted)',fontSize:13,marginBottom:12}},'Pick your name, then enter your own PIN.'),
+          leadCandidates.map(c=>e('button',{key:c.id,onClick:()=>setLeadPick(c),style:{display:'block',width:'100%',textAlign:'left',background:'var(--card)',border:'1px solid var(--border)',borderRadius:10,padding:'12px 14px',color:'inherit',fontWeight:700,marginBottom:8,cursor:'pointer'}},c.name)),
+          e('button',{className:'pin-change-btn',onClick:()=>setShowPin(null)},'Cancel')
+        ):e(CrewPinVerifyModal,{claim:leadPick,
+          onCancel:()=>{setLeadPick(null);setShowPin(null);},
+          onBound:()=>{
+            lsSet(LS_LEAD_ID,leadPick.id);
+            /* Keep the device's crew identity consistent with who just unlocked, so
+               dropping back to View shows the same person's board. */
+            if(!lsGet(LS_MY_ID))lsSet(LS_MY_ID,leadPick.id);
+            setRole('shed_lead');setShowPin(null);setLeadPick(null);
+          }})
       )
     ),
     (showPin==='lead'||showPin==='admin')&&e('div',{className:'pin-modal'},
@@ -4239,7 +4303,53 @@ function EditFarmModal({farm,onSave,onClose}){
 }
 
 
-function OverviewTab({job,role,onSend,onBroadcast,canSend,onEditFarm,isDraft,onPublish}){
+/* v4.6.13 - CREW ON THIS JOB.
+   Before this, the only way to add someone to a running job was Edit Job, which lives
+   inside the Admin tab behind the admin PIN. A shed lead standing in the shed at 7:20
+   with an extra worker in front of her had no path at all — she had to ring the office.
+   This panel is lead+admin, ADD ONLY: removing a worker can strip pay history, so that
+   stays admin. New workers created here go to the contractor roster exactly as they do
+   from the job-creation form (auto-assigned PIN and all). */
+function JobCrewPanel({job,setJob,role,crewList,addCrew}){
+  const [open,setOpen]=useState(false);
+  const [q,setQ]=useState('');
+  const [showNew,setShowNew]=useState(false);
+  const [justAdded,setJustAdded]=useState('');
+  const canAdd=role==='admin'||role==='shed_lead';
+  if(!canAdd)return null;
+  const onJobIds=job.crew||[];
+  const onJob=onJobIds.map(id=>(crewList||[]).find(c=>c.id===id)).filter(Boolean);
+  const qq=q.trim().toLowerCase();
+  const avail=(crewList||[]).filter(c=>!onJobIds.includes(c.id)&&(!qq||(c.name||'').toLowerCase().includes(qq)));
+  const addExisting=c=>{
+    if(onJobIds.includes(c.id))return;
+    /* v4.6.6 sticky worker settings + role snapshot, same seed as job creation so pay
+       behaves identically whether someone was on the job from day one or added Tuesday. */
+    const det={...((lsGet(LS_WORKER_DEFAULTS)||{})[c.id]||{}),role:c.role};
+    const next={...job,crew:[...onJobIds,c.id],
+      rates:{...(job.rates||{}),crewDetails:{...((job.rates||{}).crewDetails||{}),[c.id]:det}}};
+    setJob(()=>next);
+    dbSaveJob(next).catch(()=>{}); /* persist now — do not wait for a navigation event */
+    setJustAdded(c.name);setQ('');
+  };
+  const handleNew=async c=>{await addCrew(c);setShowNew(false);addExisting(c);};
+  return e('div',{className:'card',style:{margin:'0 16px 12px'}},
+    e('div',{style:{display:'flex',alignItems:'center',justifyContent:'space-between'}},
+      e('div',{style:{fontWeight:800,fontSize:14}},'Crew on this job ('+onJob.length+')'),
+      e('button',{onClick:()=>{setOpen(o=>!o);setJustAdded('');},style:{background:'rgba(245,158,11,.15)',border:'1px solid rgba(245,158,11,.3)',borderRadius:7,padding:'6px 10px',color:'var(--amber)',fontWeight:700,fontSize:12,cursor:'pointer'}},open?'Close':'+ Add crew')
+    ),
+    justAdded&&e('div',{style:{marginTop:8,fontSize:13,color:'var(--green,#22c55e)',fontWeight:600}},'✓ '+justAdded+' added to this job.'),
+    open&&e('div',{style:{marginTop:10}},
+      e('input',{type:'text',className:'fi',placeholder:'Search crew…',value:q,onChange:ev=>setQ(ev.target.value),style:{marginBottom:8}}),
+      avail.length===0&&e('div',{style:{color:'var(--muted)',fontSize:13,padding:'6px 0'}},qq?'No one matching — try + New crew member.':'Everyone on the roster is already on this job.'),
+      avail.slice(0,25).map(c=>e('button',{key:c.id,onClick:()=>addExisting(c),style:{display:'block',width:'100%',textAlign:'left',background:'var(--card2)',border:'1px solid var(--border)',borderRadius:9,padding:'10px 12px',color:'inherit',fontWeight:700,marginBottom:6,cursor:'pointer'}},
+        c.name,e('span',{style:{color:'var(--muted)',fontWeight:400,marginLeft:8,fontSize:12}},c.role||''))),
+      !showNew&&e('button',{className:'add-inline-btn',onClick:()=>setShowNew(true)},'+ New crew member'),
+      showNew&&e(AddCrewForm,{key:'jcp-add',onAdd:handleNew,onCancel:()=>setShowNew(false)})
+    )
+  );
+}
+function OverviewTab({job,role,onSend,onBroadcast,canSend,onEditFarm,isDraft,onPublish,setJob,crewList,addCrew}){
   const farm=gf(job.farmId);
   const [views,setViews]=useState({});
 
@@ -4265,6 +4375,7 @@ function OverviewTab({job,role,onSend,onBroadcast,canSend,onEditFarm,isDraft,onP
     e('div',{className:'info-grid'},e(IC,{l:'Job Type',v:job.type}),e(IC,{l:'Total Sheep',v:(job.totalSheep||0).toLocaleString()}),e(IC,{l:'Start Date',v:fmtDateLong(job.startDate)}),e(IC,{l:'Days Allocated',v:job.daysAllocated+' days'}),e(IC,{l:'EVOs',v:job.evos||'—'}),e(IC,{l:'Transport',v:job.transport?'✓ Yes':'No'}),e(IC,{l:'Crutching Trailer',v:job.crutchingTrailer?'✓ Provided':'Not provided'}),e(IC,{l:'Meals',v:job.meals||'Not Supplied'}),e(IC,{l:'Accommodation',v:job.accommodation||'—',full:true})),
     job.notes_job&&e('div',{style:{padding:'0 16px',marginBottom:10}},e('div',{className:'ic'},e('div',{className:'ic-l'},'Notes'),e('div',{className:'ic-v',style:{fontSize:'13px',color:'var(--muted)',fontWeight:400}},job.notes_job))),
     farm&&e('div',{style:{padding:'0 16px',marginBottom:10}},e('div',{className:'ic'},e('div',{className:'ic-l'},'Farm Address'),e('div',{className:'ic-v'},farm.address),farm.notes&&e('div',{style:{fontSize:'12px',color:'var(--dim)',marginTop:4}},farm.notes),e('a',{href:/^https?:\/\//i.test(farm.address||'')?farm.address:'https://maps.google.com/?q='+encodeURIComponent(farm.address||''),target:'_blank',className:'map-link'},'📍 Open in Maps')),role==='admin'&&onEditFarm&&e('button',{className:'map-link',style:{marginTop:6,display:'block',color:'var(--amber)',cursor:'pointer',background:'none',border:'none',padding:0,fontSize:13},onClick:onEditFarm},'✏️ Edit farm details')),
+    setJob&&e(JobCrewPanel,{job,setJob,role,crewList,addCrew}),
     e('div',{className:'crew-hdr'},e('span',null,'Crew — '+job.crew.length)),
     job.crew.map(id=>{
       const c=gc(id);if(!c)return null;
@@ -4320,7 +4431,7 @@ function OverviewTab({job,role,onSend,onBroadcast,canSend,onEditFarm,isDraft,onP
   );
 }
 /* ── JOB DETAIL ── */
-function JobDetailScreen({job,setJob,role,setRole,onBack,onSend,onBroadcast,onEdit,onDeleteJob,onPublish,initialTab}){
+function JobDetailScreen({job,setJob,role,setRole,onBack,onSend,onBroadcast,onEdit,onDeleteJob,onPublish,initialTab,crewList,addCrew}){
   const [tab,setTab]=useState(initialTab||'tallies');
   const [showEditFarm,setShowEditFarm]=useState(false);
   const farm=gf(job.farmId);
@@ -4384,7 +4495,7 @@ function JobDetailScreen({job,setJob,role,setRole,onBack,onSend,onBroadcast,onEd
         (k==='whiteboard'&&wbCount>0)?e('span',null,l,e('span',{style:{marginLeft:4,background:'#e53e3e',color:'#fff',borderRadius:10,fontSize:'10px',padding:'1px 6px',fontWeight:800,verticalAlign:'middle'}},wbCount>9?'9+':wbCount)):l))),
       tab==='tallies'&&e(TallyTab,{job,setJob,role,viewDate,setViewDate}),
       tab==='progress'&&e(ProgressTab,{job}),
-      tab==='overview'&&e(OverviewTab,{job,role,onSend,onBroadcast,canSend,onEditFarm:role==='admin'?()=>setShowEditFarm(true):null,isDraft,onPublish}),
+      tab==='overview'&&e(OverviewTab,{job,role,onSend,onBroadcast,canSend,onEditFarm:role==='admin'?()=>setShowEditFarm(true):null,isDraft,onPublish,setJob,crewList,addCrew}), /* v4.6.13 - crew panel needs roster + writer */
       tab==='whiteboard'&&e(WhiteboardTab,{job,role}),
       tab==='summary'&&e(SummaryTab,{job,setJob,role}),
       tab==='admin'&&role==='admin'&&e(AdminTab,{job,setJob,onEdit,onDeleteFarm:()=>{const farm=gf(job.farmId);if(!farm)return;dbDeleteFarm(farm.id);setFarmList(p=>{const n=p.filter(f=>f.id!==farm.id);syncLookups(n,CREW);return n;});},onDeleteJob,onPublish}),
@@ -4519,6 +4630,13 @@ function buildJobCardSMS(job,crewId,farmList,crewList,appUrl){
     'Open the link to view the job:',
     appUrl+'/?job='+job.id+'&crew='+crewId, /* v4.6.11f - query not fragment: fragments are stripped by Android PWA intent launches and some SMS linkifiers */
     '',
+    /* v4.6.13 — lead block goes ONLY to the designated lead, so the extra segment is one
+       message per job, not one per crew member. GSM-7 strictly: no emoji, no em-dash. */
+    ...((job.leadId&&job.leadId===crewId&&crew.pin)?[
+      'You are the shed lead for this job.',
+      'In the app tap Lead (top right) and enter your PIN: '+crew.pin,
+      ''
+    ]:[]),
     'Please do not reply to this text - contact us directly with any questions.'
   ].join('\n');
 }
@@ -4824,6 +4942,33 @@ function AddCrewForm({onAdd,onCancel}){
   );
 }
 
+/* v4.6.13 - DESIGNATED LEAD picker. Shared by New Job and Edit Job so the two can never
+   drift. Candidates are the crew ALREADY ON THIS JOB — a lead who is not at the shed is
+   not a lead. A worker with no PIN cannot be designated (they would have nothing to
+   unlock with); the field says so rather than silently omitting them. */
+function LeadPickField({selCrew,crewList,leadId,setLeadId}){
+  if(!designatedLeadsOn())return null;
+  const onJob=(selCrew||[]).map(id=>(crewList||[]).find(c=>c.id===id)).filter(Boolean);
+  const eligible=onJob.filter(c=>c.pin);
+  const pinless=onJob.filter(c=>!c.pin);
+  /* A lead dropped from the job's crew must not stay designated. Resolved for display
+     here (never setState during render); the modals sanitise again on submit. */
+  const effLead=(selCrew||[]).includes(leadId)?leadId:'';
+  return e(FF,{label:'Shed lead (optional)'},
+    e('div',null,
+      e('select',{className:'if-sel',value:effLead,onChange:ev=>setLeadId(ev.target.value)},
+        e('option',{value:''},'— No designated lead —'),
+        eligible.map(c=>e('option',{key:c.id,value:c.id},c.name))
+      ),
+      e('div',{style:{fontSize:'11px',color:'var(--muted)',marginTop:5}},
+        effLead
+          ?'📋 They unlock Lead with their own 4-digit PIN and see only this shed.'
+          :'📋 Leave blank and the shared Lead PIN opens this job as usual.'),
+      pinless.length>0&&e('div',{style:{fontSize:'11px',color:'var(--muted)',marginTop:4}},
+        'No PIN yet: '+pinless.map(c=>c.name).join(', ')+' — set one in My Database to designate them.')
+    )
+  );
+}
 function NewJobModal({onClose,onCreate,farmList,crewList,addFarm,addCrew,jobs}){
   /* Only UI-driving state — NO controlled text inputs */
   const [type,setType]=useState('Shearing');
@@ -4843,6 +4988,7 @@ function NewJobModal({onClose,onCreate,farmList,crewList,addFarm,addCrew,jobs}){
   const [selCrew,setSelCrew]=useState([]);
   const [showAddFarm,setShowAddFarm]=useState(false);
   const [showAddCrew,setShowAddCrew]=useState(false);
+  const [leadId,setLeadId]=useState(''); /* v4.6.13 - designated shed lead */
   const [submitErr,setSubmitErr]=useState('');
   const [farmQuery,setFarmQuery]=useState('');
 
@@ -4902,6 +5048,7 @@ function NewJobModal({onClose,onCreate,farmList,crewList,addFarm,addCrew,jobs}){
       evos,crutchingTrailer,transport,meals,
       accommodation:rAccomm.current?.value||'',
       status:asDraft?'Draft':'Active',crew:selCrew,
+      leadId:(selCrew.includes(leadId)?leadId:'')||null, /* v4.6.13 */
       jobPin:rJobPin.current?.value?.trim()||null,
       jobName:rJobName.current?.value?.trim()||'',
       rates:{...mkRates(),crewDetails:initialCrewDetails},
@@ -4981,6 +5128,7 @@ function NewJobModal({onClose,onCreate,farmList,crewList,addFarm,addCrew,jobs}){
           showAddCrew&&e(AddCrewForm,{key:'add-crew',onAdd:handleAddCrew,onCancel:()=>setShowAddCrew(false)})
         )
       ),
+      e(LeadPickField,{selCrew,crewList,leadId,setLeadId}),
       submitErr&&e('div',{style:{padding:'0 16px 12px',fontSize:'13px',color:'var(--red)',fontWeight:600}},submitErr)
     ),
     e('div',{style:{position:'fixed',bottom:0,left:0,right:0,background:'var(--card)',borderTop:'1px solid var(--border)',padding:'12px 16px',display:'flex',gap:8,zIndex:10}},
@@ -5002,6 +5150,7 @@ function EditJobScreen({job,onSave,onClose,farmList,addFarm,crewList,addCrew}){
   const [farmQuery,setFarmQuery]=useState('');
   const [showAddFarm,setShowAddFarm]=useState(false);
   const [showAddCrew,setShowAddCrew]=useState(false);
+  const [leadId,setLeadId]=useState(job.leadId||''); /* v4.6.13 - designated shed lead */
   const [selCrew,setSelCrew]=useState(job.crew||[]);
   const [submitErr,setSubmitErr]=useState('');
 
@@ -5039,6 +5188,7 @@ function EditJobScreen({job,onSave,onClose,farmList,addFarm,crewList,addCrew}){
       jobPin:rJobPin.current?.value?.trim()||null,
       jobName:rJobName.current?.value?.trim()||'',
       crew:selCrew,
+      leadId:(selCrew.includes(leadId)?leadId:'')||null, /* v4.6.13 */
       rates:{...(job.rates||{}),crewDetails:newDetails},
     });
   };
@@ -5140,6 +5290,7 @@ function EditJobScreen({job,onSave,onClose,farmList,addFarm,crewList,addCrew}){
           showAddCrew&&e(AddCrewForm,{key:'add-crew',onAdd:handleAddCrew,onCancel:()=>setShowAddCrew(false)})
         )
       ),
+      e(LeadPickField,{selCrew,crewList,leadId,setLeadId}),
       submitErr&&e('div',{style:{padding:'0 16px 12px',fontSize:'13px',color:'var(--red)',fontWeight:600}},submitErr)
     ),
     e('div',{style:{position:'fixed',bottom:0,left:0,right:0,background:'var(--card)',borderTop:'1px solid var(--border)',padding:'12px 16px',display:'flex',gap:10,zIndex:10}},
@@ -5151,7 +5302,13 @@ function EditJobScreen({job,onSave,onClose,farmList,addFarm,crewList,addCrew}){
 
 
 /* ── HOME ── */
-function HomeScreen({jobs,role,setRole,onJob,onNew,onDatabase,onSchedule,contractorName}){
+function HomeScreen({jobs:allJobs,role,setRole,onJob,onNew,onDatabase,onSchedule,contractorName}){
+  /* v4.6.13 - a designated lead sees ONLY the sheds they are lead on. Shadowing the prop
+     here scopes every downstream list (active/completed/archive/banner) in one place, so
+     no future list can quietly escape the filter. Admin is never scoped. Toggle off or no
+     lead bound = allJobs, i.e. v4.6.12 behaviour byte for byte. */
+  const _leadScope=(role==='shed_lead')?boundLeadId():null;
+  const jobs=_leadScope?(allJobs||[]).filter(j=>leadCanSeeJob(j,_leadScope)):allJobs;
   const [search,setSearch]=useState('');
   const [sort,setSort]=useState('date'); /* date | name | size | progress */
   const [showArchive,setShowArchive]=useState(false);
@@ -5581,7 +5738,10 @@ function ScheduleScreen({jobs,role,setRole,onBack,onJob,onNew,onNewDraft}){
   const today=localToday();
   /* v4.6.10 - crew view: read_only devices with an identity see only their own jobs */
   const myIdSched=(role==='read_only')?(lsGet(LS_MY_ID)||null):null;
-  const visJobs=myIdSched?jobs.filter(j=>j.status!=='Draft'&&(j.crew||[]).includes(myIdSched)):jobs;
+  /* v4.6.13 - designated lead scoping, same rule as Home */
+  const leadScopeSched=(role==='shed_lead')?boundLeadId():null;
+  const scopedJobs=leadScopeSched?jobs.filter(j=>leadCanSeeJob(j,leadScopeSched)):jobs;
+  const visJobs=myIdSched?scopedJobs.filter(j=>j.status!=='Draft'&&(j.crew||[]).includes(myIdSched)):scopedJobs;
   /* v4.6.10 - filter bar */
   const [fStatus,setFStatus]=useState('All');
   const [fType,setFType]=useState('All');
@@ -5888,6 +6048,8 @@ function App(){
   const persistRole=r=>{setRole(r);lsSet(LS_ROLE,r);lsSet(LS_ROLE_TS,Date.now());};
   const [selJobId,setSelJobId]=useState(null);
   const [jobs,setJobs]=useState([]);
+  /* v4.6.13 - mirror jobs for TopBar's lead picker (same pattern as syncLookups) */
+  useEffect(()=>{syncJobsLookup(jobs);},[jobs]);
   const [farmList,setFarmList]=useState([]);
   const [crewList,setCrewList]=useState([]);
   const [showSMS,setShowSMS]=useState(false);
@@ -6491,6 +6653,13 @@ function App(){
       }
     }
     const job=jobs.find(j=>j.id===id);
+    /* v4.6.13 - the list filters are the visible guard; this is the one that actually holds.
+       A deep link, a stale back-stack entry or a whiteboard badge tap must not walk a scoped
+       lead into another team's shed. Drop them to View for that job rather than to an error. */
+    if(job&&role==='shed_lead'){
+      const ls=boundLeadId();
+      if(ls&&!leadCanSeeJob(job,ls)){persistRole('read_only');}
+    }
     if(job?.jobPin&&role!=='admin'){
       setJobPinPending(id);
     }else{
@@ -6585,7 +6754,7 @@ function App(){
     e(StatusBar),
     screen==='home'&&e(HomeScreen,{jobs,role,setRole:persistRole,onJob:goJob,onNew:()=>setShowNew(true),onDatabase:()=>setShowDatabase(true),onSchedule:goSchedule,contractorName:CONTRACTOR_NAME}),
     screen==='schedule'&&role!=='read_only'&&e(ScheduleScreen,{jobs,role,setRole:persistRole,onBack:goHome,onJob:goJob,onNew:()=>setShowNew(true),onNewDraft:()=>setShowNew(true)}),
-    screen==='job'&&selJob&&e(JobDetailScreen,{job:selJob,setJob:setSelJob,role,setRole:persistRole,onBack:goHome,onSend:()=>setShowSMS(true),onBroadcast:()=>setShowBroadcast(true),gfl,gcl,onEdit:()=>setShowEdit(true),onPublish:publishJob,onDeleteJob:async()=>{const id=selJob.id;setSelJobId(null);await dbDeleteJob(id);setJobs(p=>p.filter(j=>j.id!==id));setScreen('home');setShowSMS(false);setPreviewId(null);setJobPinPending(null);},initialTab:deepLinkTab,key:selJobId+(deepLinkTab||'')}),
+    screen==='job'&&selJob&&e(JobDetailScreen,{job:selJob,setJob:setSelJob,role,setRole:persistRole,onBack:goHome,onSend:()=>setShowSMS(true),onBroadcast:()=>setShowBroadcast(true),gfl,gcl,onEdit:()=>setShowEdit(true),onPublish:publishJob,onDeleteJob:async()=>{const id=selJob.id;setSelJobId(null);await dbDeleteJob(id);setJobs(p=>p.filter(j=>j.id!==id));setScreen('home');setShowSMS(false);setPreviewId(null);setJobPinPending(null);},initialTab:deepLinkTab,crewList,addCrew,key:selJobId+(deepLinkTab||'')}),
     showSMS&&selJob&&e(SMSModal,{job:selJob,onClose:()=>{setShowSMS(false);setPreviewId(null);},onPreview:id=>setPreviewId(id),farmList,crewList}),
     showBroadcast&&selJob&&e(BroadcastModal,{job:selJob,onClose:()=>setShowBroadcast(false),farmList,crewList}),
     previewId&&selJob&&e(JobCardView,{job:selJob,crewId:previewId,onClose:()=>setPreviewId(null),gfl,gcl}),
