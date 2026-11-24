@@ -624,10 +624,11 @@ const LS_TALLY_QUEUE='mg_tally_queue_'+CONTRACTOR_SLUG; /* per-cell offline queu
 const LS_TALLY_DEAD='mg_tally_dead_'+CONTRACTOR_SLUG; /* v4.6.3g — quarantined cells (permanent rejection). Replayed once on boot in case the server-side blocker (e.g. missing kind constraint) was since fixed. */
 const LS_TALLY_META_QUEUE='mg_tally_meta_queue_'+CONTRACTOR_SLUG; /* v4.6.4 — offline/failed mob metadata (type/desc) updates to existing count cells; flushed alongside the tally queue. */
 const ROLE_TIMEOUT_HOURS=12; /* auto-reset after 12h inactivity */
-const APP_VERSION='v4.6.73r';
+const APP_VERSION='v4.6.73s';
 /* v4.6.73r (18 Nov 2026): HOME SCREEN KNOWS ALL MY RECORDS. Craig (Knights) is three crew records on one phone; 'My jobs' only matched the one his phone picked, so Deltroit was missing. My jobs and My tallies now count every record that shares my phone number (same rule as broadcasts since 72m). Chat identity, Viewed markers and pay unchanged. */
 /* v4.6.73q (16 Nov 2026): 'Also works as' is a one-line picker - rows only for people with a second role, '+ Add a second role' opens Who / Also as. No change to data, save or pay. */
 /* v4.6.73p (16 Nov 2026): ONE PERSON, SEVERAL ROLES ON A JOB. Jamie (CJ) shears and pens the same day. crewDetails[id].extraRoles (optional) + 'Also works as' in Edit Job. The board, shed grid, ganger pick, summary and the shed-runs pay loop read any of the person's roles; shed runs are paid as the person's shed role (primary when it is one, else the first extra). pieceIds unchanged in effect (counts already paid to whoever has them). Stand fee stays primary-role only. Without extraRoles nothing changes: replay harness 0 pay differences across every job in the database. */
+/* v4.6.73s (24 Nov 2026): READ THE BOOK. 'Read this page' under the end-of-day book photo (lead/admin, needs signal) sends the photo to the broker (/api/book/read, vision model via Vercel AI Gateway) and shows a review sheet: the page's numbers per shearer x run beside what the board holds, ⚠ where the reader was unsure, a picker for names it could not match, warnings from the page totals. Apply writes through setMobCnt - the normal cell path - only the cells the lead ticked. Counts only; nothing written until Apply; metered in book_reads. Trial 24 Nov: 20 real pages, 303 cells, 0 misread digits. Pay engine, save layer, DATA_VERSION untouched. */
 /* v4.6.73o (12 Nov 2026): SHED RUNS TO XERO BY ROLE. Shelley (Knights): classers and pressers came across as 'Shedhand HR'. Every run went out as one component. Lines now carry the role they were paid under; the Xero payload sends classer runs as classer_runs and presser runs as presser_runs, wool handlers and penners stay shed_runs; two new rows in My Database > Xero > Pay items. The broker uses the Shed staff runs item for either until it is mapped. Pay engine untouched. */
 /* v4.6.73n (12 Nov 2026): PAYG TO XERO. Teegan (Knights, 5 Nov): every payslip needed a manual tax adjustment because shearers are withheld at a flat rate. The push now sends each worker's myGang tax (sum of per-job Tax Withholding % slices, as the Pay Week report) and the %; the broker reads Xero's own PAYG and posts the difference as a manual adjustment, proven on Demo Company 12 Nov (probe Q4-Q7, pushtest). No % = Xero's tables, untouched. Dry run shows the PAYG column; result flags any payslip whose tax missed. Pay engine unchanged. */
 /* v4.6.73m (30 Oct 2026): BROADCAST CAP IS A WARNING, NOT A LIMIT. Josh (Knights): 'I'm not concerned with the $2, I'd prefer the clear received message.' SMS is metered to the contractor, so the 2-text cap only ever protected their own money. Full-text mode still shows segments x people and the dollar figure before Send and flags a long message; it no longer refuses. The sheet remembers the last mode used on this phone. No other change. */
@@ -5161,10 +5162,17 @@ async function compressPhoto(file,maxDim,quality){
     return blob;
   }finally{URL.revokeObjectURL(url);}
 }
-function BookPhotoPanel({job,viewDate,role}){
+function BookPhotoPanel({job,viewDate,role,dayRuns,shearers,onApply}){
   const canSee=role==='admin'||role==='shed_lead'||role==='farmer';
   const canTake=role==='admin'||role==='shed_lead';
   const [rec,setRec]=useState(null);
+  /* v4.6.73s - read the page */
+  const [reading,setReading]=useState(false);
+  const [prop,setProp]=useState(null);   /* broker proposal */
+  const [edits,setEdits]=useState({});   /* cellKey -> {value,use} */
+  const [assign,setAssign]=useState({}); /* unmatched row index -> crewId */
+  const [applied,setApplied]=useState(0);
+  useEffect(()=>{setProp(null);setEdits({});setAssign({});setApplied(0);},[job.id,viewDate]);
   const [busy,setBusy]=useState(false);
   const [msg,setMsg]=useState('');
   const fileRef=useRef();
@@ -5202,6 +5210,59 @@ function BookPhotoPanel({job,viewDate,role}){
     setBusy(false);
   };
   const pubUrl=rec?sb.storage.from('book-photos').getPublicUrl(rec.path).data.publicUrl+'?t='+encodeURIComponent(rec.taken_at):null;
+  /* ── v4.6.73s READ THE BOOK ─────────────────────────────────────────────
+     Proposal only. The broker never writes; Apply goes through onApply (= setMobCnt). */
+  const canRead=canTake&&!!onApply&&!!rec&&(dayRuns||[]).length>0;
+  const boardVal=(runId,mobId,cid)=>{const r=(dayRuns||[]).find(x=>x.id===runId);const m=r?mobsOf(r).find(x=>x.id===mobId):null;return m&&m.counts?(m.counts[cid]||0):0;};
+  const ck=c=>c.crewId+'|'+c.runId+'|'+c.mobId;
+  const doRead=async()=>{
+    if(!navigator.onLine){setMsg(NOSIG);return;}
+    setReading(true);setMsg('');setProp(null);setEdits({});setAssign({});setApplied(0);
+    try{
+      const j=await xeroFetch('/api/book/read',{timeoutMs:70000,body:{jobId:job.id,date:viewDate,
+        shearers:(shearers||[]).map(x=>({id:x.id,name:x.name})),
+        runs:(dayRuns||[]).map(r=>({id:r.id,mobs:mobsOf(r).map(m=>({id:m.id,type:m.type,desc:m.desc||''}))}))}});
+      if(!j||!j.ok)throw new Error((j&&j.error)||'The reader did not answer.');
+      const ed={};(j.cells||[]).forEach(c=>{const b=boardVal(c.runId,c.mobId,c.crewId);ed[ck(c)]={value:c.value,use:!(b>0&&b!==c.value)};});
+      setEdits(ed);setProp(j);
+    }catch(err){setMsg(err.code==='no_photo'?'No photo for this day yet.':err.code==='photo_big'?err.message:('Could not read the page — '+(err.message||'try again with signal.')));}
+    setReading(false);
+  };
+  const applyAll=()=>{
+    if(!prop||!onApply)return;
+    let n=0;
+    (prop.cells||[]).forEach(c=>{const ed=edits[ck(c)];if(!ed||!ed.use)return;const v=parseInt(ed.value);if(!(v>=0))return;onApply(c.runId,c.mobId,c.crewId,v);n++;});
+    (prop.unmatched||[]).forEach((u,i)=>{const cid=assign[i];if(!cid)return;(u.cells||[]).forEach(cell=>{const run=(dayRuns||[]).find(r=>r.id===((prop.ctx&&prop.ctx.runs||[]).find(x=>x.index===Number(cell.run))||{}).id);if(!run)return;const nums=(cell.numbers||[]).map(Number).filter(x=>x>=0);if(!nums.length)return;const mobs=mobsOf(run);if(mobs.length===1||nums.length===1){onApply(run.id,mobs[0].id,cid,nums.reduce((a,b)=>a+b,0));n++;}else nums.forEach((v,k)=>{const m=mobs[Math.min(k,mobs.length-1)];onApply(run.id,m.id,cid,v);n++;});});});
+    setApplied(n);setProp(null);
+  };
+  const byShearer=prop?(prop.cells||[]).reduce((a,c)=>{(a[c.crewId]=a[c.crewId]||{name:c.name,cells:[]}).cells.push(c);return a;},{}):{};
+  const runLbl=(c)=>'R'+c.runIndex+((prop&&prop.ctx&&prop.ctx.runs||[]).some(r=>r.index===c.runIndex&&r.mobs.length>1)?' '+(c.mobDesc||'').slice(0,10):'');
+  const reviewSheet=prop&&e('div',{style:{marginTop:10,border:'1px solid var(--border)',borderRadius:10,padding:10,background:'var(--card)'}},
+    e('div',{style:{fontWeight:800,marginBottom:4}},'From the book — check, then apply'),
+    e('div',{style:{fontSize:12,color:'var(--muted)',marginBottom:8}},'Ticked cells go on the board. Where the board already has a different number it is left unticked — tap to use the book’s number instead. ⚠ = the reader was not sure, look at the photo.'),
+    Object.keys(byShearer).map(cid=>e('div',{key:cid,style:{marginBottom:8}},
+      e('div',{style:{fontWeight:700,fontSize:13,marginBottom:3}},byShearer[cid].name),
+      e('div',{style:{display:'flex',flexWrap:'wrap',gap:6}},
+        byShearer[cid].cells.map(c=>{const k=ck(c);const ed=edits[k]||{};const b=boardVal(c.runId,c.mobId,c.crewId);const diff=b>0&&b!==Number(ed.value);
+          return e('label',{key:k,style:{display:'flex',alignItems:'center',gap:4,border:'1px solid '+(ed.use?'var(--green)':'var(--border)'),borderRadius:8,padding:'4px 6px',fontSize:12,background:ed.use?'rgba(46,125,79,.08)':'transparent'}},
+            e('input',{type:'checkbox',checked:!!ed.use,onChange:ev=>setEdits(p=>({...p,[k]:{...(p[k]||{}),use:ev.target.checked}}))}),
+            e('span',{style:{color:'var(--muted)'}},runLbl(c)),
+            e('input',{type:'text',inputMode:'numeric',value:ed.value==null?'':ed.value,onChange:ev=>setEdits(p=>({...p,[k]:{...(p[k]||{}),value:ev.target.value.replace(/\D/g,'')}})),style:{width:44,textAlign:'center',fontWeight:700}}),
+            c.flag&&e('span',{title:c.note||'unsure',style:{color:'var(--amber)',fontWeight:800}},'⚠'),
+            diff&&e('span',{style:{color:'var(--muted)'}},'board '+b));
+        })))),
+    (prop.unmatched||[]).length>0&&e('div',{style:{marginTop:6}},
+      e('div',{style:{fontWeight:700,fontSize:13,marginBottom:3}},'Names on the page not matched \u2014 pick who, or skip (only people without a row above)'),
+      (prop.unmatched||[]).map((u,i)=>e('div',{key:i,style:{display:'flex',alignItems:'center',gap:6,marginBottom:4,fontSize:12}},
+        e('span',{style:{minWidth:70,fontWeight:700}},u.nameOnPage||'?'),
+        e('span',{style:{color:'var(--muted)'}},(u.cells||[]).map(c=>(c.numbers||[]).join('/')).join(' · ')),
+        e('select',{value:assign[i]||'',onChange:ev=>setAssign(p=>({...p,[i]:ev.target.value})),style:{marginLeft:'auto'}},
+          e('option',{value:''},'skip'),(shearers||[]).filter(x=>!byShearer[x.id]).map(x=>e('option',{key:x.id,value:x.id},x.name)))))),
+    (prop.warnings||[]).length>0&&e('div',{style:{marginTop:6,fontSize:12,color:'var(--muted)'}},(prop.warnings||[]).map((w,i)=>e('div',{key:i},'• '+w))),
+    e('div',{style:{display:'flex',gap:8,marginTop:10}},
+      e('button',{className:'btn-g',style:{flex:1},onClick:applyAll},'Apply ticked to the board'),
+      e('button',{className:'btn-g',style:{flex:1,opacity:.8},onClick:()=>setProp(null)},'Discard')),
+    prop.meta&&e('div',{style:{fontSize:11,color:'var(--dim)',marginTop:6,textAlign:'right'}},'Read in '+Math.round((prop.meta.ms||0)/1000)+'s'));
   return e('div',{className:'notes-wrap',style:{marginTop:10}},
     e('div',{className:'notes-lbl'},'📓 End of day book \u2014 '+fmtDateLong(viewDate)),
     rec&&pubUrl&&e('a',{href:pubUrl,target:'_blank',rel:'noopener'},
@@ -5211,6 +5272,9 @@ function BookPhotoPanel({job,viewDate,role}){
     busy&&e('div',{style:{color:'var(--muted)',fontSize:13,margin:'6px 0'}},'Uploading\u2026'),
     msg&&e('div',{style:{color:'var(--amber)',fontSize:13,margin:'6px 0',fontWeight:700}},msg),
     canTake&&e('button',{className:'btn-g',style:{width:'100%',marginTop:6},disabled:busy,onClick:doPick},rec?'Replace photo':'📷 Add book photo'),
+    canRead&&!prop&&e('button',{className:'btn-g',style:{width:'100%',marginTop:6},disabled:reading||busy,onClick:doRead},reading?'Reading the page…':'🔍 Read this page onto the board'),
+    applied>0&&!prop&&e('div',{style:{color:'var(--green)',fontSize:13,margin:'6px 0',fontWeight:700}},applied+' cells applied from the book. Check the board above.'),
+    reviewSheet,
     /* v4.6.51 — `capture:'environment'` forced the camera and hid the gallery, so
        a photo already taken on the phone could not be used. Dropping the
        attribute lets the OS offer camera OR gallery; taking one there and then
@@ -6052,7 +6116,7 @@ const flushMobDesc=(mid,v)=>{
           catch(e){return '';}
         })():''))
     ),
-    e(BookPhotoPanel,{job,viewDate,role}), /* v4.6.11 */
+    e(BookPhotoPanel,{job,viewDate,role,dayRuns,shearers:orderedShearers.map(id=>({id,name:(gc(id)||{}).name||id})),onApply:canEdit?setMobCnt:null}), /* v4.6.11; v4.6.73s read */
     e('div',{style:{height:20}})
   );
 }
